@@ -16,8 +16,8 @@ Currently only tested on linux and macos.
 
 ## Usage
 
-Just run `./tabs`, by default tabs are stored in the dir where you call the tool
-from.
+Just run `./tabs`, by default tabs are stored in ~/.tabs/ and images get saved
+in the directory where you are running the tool in.
 
 ## License
 
