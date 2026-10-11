@@ -23,9 +23,11 @@ type
     focus:    Focus
     mode:     Mode
     section:  int
+    part:     int
     row:      int
     col:      int
     scroll:   int
+    vscroll:  int
     pending:  string
     status:   string
     label:    string
@@ -50,92 +52,93 @@ proc slot(t: Tablature, row: int): int =
   ## Maps a grid row (highest string first) to its position in the tuning.
   t.header.tuning.len - 1 - row
 
-proc normalize(e: var TabEntry, tuning: seq[char]): int =
-  ## Lays out e.tab as one slot per tuning string, in tuning order. The n-th
-  ## line for a letter maps to the n-th string with that letter, so with
-  ## C G C F the first `c:` line is the low C and the second the high C.
-  ## Returns how many non-empty lines had no matching string.
-  var slots: typeof(e.tab)
-  for s in tuning: slots.add (s, newSeq[StringNotation]())
-  var used = newSeq[bool](tuning.len)
-  for line in e.tab:
-    var placed = false
-    for i, s in tuning:
-      if s == line[0] and not used[i]:
-        slots[i][1] = line[1]
-        used[i]     = true
-        placed      = true
-        break
-    if not placed and line[1].len > 0: inc result
-  e.tab = slots
+proc trimStrings(p: var TabPart, count: int): int =
+  ## Drops the lines of strings past the first count, e.g. after the tuning
+  ## loses strings. Returns how many of them had notes.
+  for i in toSeq(p.tabs.keys):
+    if i >= count:
+      if p.tabs[i].len > 0: inc result
+      p.tabs.del i
 
-proc fretAt(e: TabEntry, s, idx: int): int =
-  for n in e.tab[s][1]:
+proc fretAt(p: TabPart, s, idx: int): int =
+  for n in p.tabs.getOrDefault(s):
     if n.index == idx: return n.note
   -1
 
-proc setFret(e: var TabEntry, s, idx, fret: int) =
-  e.tab[s][1].keepItIf(it.index != idx)
-  e.tab[s][1].add StringNotation(note: fret, index: idx)
-  e.tab[s][1].sort(proc(a, b: StringNotation): int = cmp(a.index, b.index))
+proc clearFret(p: var TabPart, s, idx: int) =
+  if s in p.tabs:
+    p.tabs[s].keepItIf(it.index != idx)
 
-proc clearFret(e: var TabEntry, s, idx: int) =
-  e.tab[s][1].keepItIf(it.index != idx)
+proc setFret(p: var TabPart, s, idx, fret: int) =
+  p.clearFret(s, idx)
+  p.tabs.mgetOrPut(s, @[]).add StringNotation(note: fret, index: idx)
+  p.tabs[s].sort(proc(a, b: StringNotation): int = cmp(a.index, b.index))
 
-proc shiftColumns(e: var TabEntry, start, delta: int) =
+proc shiftColumns(p: var TabPart, start, delta: int) =
   ## Moves every note at index >= start by delta.
-  for line in e.tab.mitems:
-    for n in line[1].mitems:
+  for line in p.tabs.mvalues:
+    for n in line.mitems:
       if n.index >= start: n.index += delta
 
-proc deleteColumn(e: var TabEntry, idx: int) =
-  for s in 0 ..< e.tab.len:
-    e.clearFret(s, idx)
-  e.shiftColumns(idx + 1, -1)
+proc deleteColumn(p: var TabPart, idx: int) =
+  for line in p.tabs.mvalues:
+    line.keepItIf(it.index != idx)
+  p.shiftColumns(idx + 1, -1)
 
-proc lastIndex(e: TabEntry): int =
+proc lastIndex(p: TabPart): int =
   result = -1
-  for line in e.tab:
-    for n in line[1]: result = max(result, n.index)
+  for line in p.tabs.values:
+    for n in line: result = max(result, n.index)
+
+proc lastIndex(s: TabSection): int =
+  result = -1
+  for p in s.parts: result = max(result, p.lastIndex)
+
+proc isEmpty(p: TabPart): bool =
+  toSeq(p.tabs.values).allIt(it.len == 0)
 
 proc unsavable(t: Tablature): string =
-  ## The parser rejects empty lines, so an empty string cannot be skipped
-  ## when a later string with the same letter has notes: that line would be
-  ## read back as the earlier string.
-  for e in t.entries:
-    for i, line in e.tab:
-      if line[1].len > 0: continue
-      for j in i + 1 ..< e.tab.len:
-        if e.tab[j][0] == line[0] and e.tab[j][1].len > 0:
-          let s = ($line[0]).toUpperAscii
-          return &"'{e.name}': string {j + 1} ({s}) has notes but " &
-                 &"string {i + 1} ({s}) is empty, the format can't express it"
+  ## The parser rejects a part with no string lines.
+  for sec in t.sections:
+    for k, p in sec.parts:
+      if p.isEmpty:
+        return &"'{sec.name}' part {k + 1} is empty, the format can't express it"
   ""
 
 proc serialize(t: Tablature): string =
-  ## Inverse of parseTablature, expects normalized entries.
+  ## Inverse of parseTablature. Strings are written by their index in the
+  ## tuning, skipping the ones without notes.
   let tuning = t.header.tuning.mapIt(($it).toUpperAscii).join(" ")
   result = &"song: {t.header.song}\nartist: {t.header.artist}\n" &
            &"instrument: {t.header.instrument}\ntuning: {tuning}\n"
-  for e in t.entries:
-    result.add &"::::\nname: {e.name}\nrepeats: {e.repeats}\n"
-    for line in e.tab:
-      if line[1].len == 0: continue
-      let body = line[1].mapIt(&"{it.note},{it.index}").join(";")
-      result.add &"{line[0]}: {body}\n"
+  for sec in t.sections:
+    result.add &"::::\nname: {sec.name}\n"
+    for p in sec.parts:
+      result.add &"----\nrepeats: {p.repeats}\n"
+      for i in 0 ..< t.header.tuning.len:
+        let line = p.tabs.getOrDefault(i)
+        if line.len == 0: continue
+        let body = line.mapIt(&"{it.note},{it.index}").join(";")
+        result.add &"{i}: {body}\n"
 
 proc validField(s: string): bool =
-  ## The format is line/colon based, so values cannot contain either.
-  ':' notin s and '\n' notin s
+  ## The format is line/colon based and splits parts on "----", so values
+  ## cannot contain any of those.
+  ':' notin s and '\n' notin s and "----" notin s
 
 # ---------------------------------------------------------------------------
 # Editor actions
 # ---------------------------------------------------------------------------
 
-proc current(ed: Editor): var TabEntry = ed.tab.entries[ed.section]
+proc current(ed: Editor): var TabSection = ed.tab.sections[ed.section]
+
+proc currentPart(ed: Editor): var TabPart = ed.current.parts[ed.part]
 
 proc hasSection(ed: Editor): bool =
-  ed.section in 0 ..< ed.tab.entries.len
+  ed.section in 0 ..< ed.tab.sections.len
+
+proc hasPart(ed: Editor): bool =
+  ed.hasSection and ed.part in 0 ..< ed.current.parts.len
 
 proc prompt(ed: Editor, label, initial: string, onSubmit: proc(s: string)) =
   ed.mode     = modePrompt
@@ -163,46 +166,48 @@ proc save(ed: Editor) =
     ed.status = &"save failed: {e.msg}"
 
 proc clampCursor(ed: Editor) =
-  ed.section = clamp(ed.section, 0, max(ed.tab.entries.len - 1, 0))
+  ed.section = clamp(ed.section, 0, max(ed.tab.sections.len - 1, 0))
+  let parts  = if ed.hasSection: ed.current.parts.len else: 0
+  ed.part    = clamp(ed.part, 0, max(parts - 1, 0))
   ed.row     = clamp(ed.row, 0, max(ed.tab.strings.len - 1, 0))
   ed.col     = max(ed.col, 0)
+
+proc selectSection(ed: Editor, i: int) =
+  if i == ed.section: return
+  ed.section = i
+  ed.part    = 0
+  ed.vscroll = 0
+  ed.clampCursor()
 
 proc addSection(ed: Editor) =
   ed.prompt("new section name: ", "", proc(s: string) =
     if not s.validField:
-      ed.status = "name cannot contain ':'"
+      ed.status = "name cannot contain ':' or '----'"
       return
     let at = if ed.hasSection: ed.section + 1 else: 0
-    var entry = TabEntry(name: s.strip, repeats: 1)
-    discard entry.normalize(ed.tab.header.tuning)
-    ed.tab.entries.insert(entry, at)
+    let section = TabSection(name: s.strip,
+                             parts: @[TabPart(repeats: 1)])
+    ed.tab.sections.insert(section, at)
     ed.section = at
+    ed.part    = 0
+    ed.vscroll = 0
     ed.dirty   = true)
 
 proc renameSection(ed: Editor) =
   if not ed.hasSection: return
   ed.prompt("rename section: ", ed.current.name, proc(s: string) =
     if not s.validField:
-      ed.status = "name cannot contain ':'"
+      ed.status = "name cannot contain ':' or '----'"
       return
     ed.current.name = s.strip
     ed.dirty = true)
 
-proc setRepeats(ed: Editor) =
-  if not ed.hasSection: return
-  ed.prompt("repeats: ", $ed.current.repeats, proc(s: string) =
-    try:
-      let n = s.strip.parseInt
-      if n < 0: raise newException(ValueError, "negative")
-      ed.current.repeats = n
-      ed.dirty = true
-    except ValueError:
-      ed.status = &"invalid repeats: {s}")
-
 proc deleteSection(ed: Editor) =
   if not ed.hasSection: return
   ed.confirm(&"delete section '{ed.current.name}'?", proc(s: string) =
-    ed.tab.entries.delete ed.section
+    ed.tab.sections.delete ed.section
+    ed.part    = 0
+    ed.vscroll = 0
     ed.clampCursor()
     ed.dirty = true)
 
@@ -210,16 +215,57 @@ proc duplicateSection(ed: Editor) =
   if not ed.hasSection: return
   var copy = ed.current
   copy.name &= " (copy)"
-  ed.tab.entries.insert(copy, ed.section + 1)
-  inc ed.section
+  ed.tab.sections.insert(copy, ed.section + 1)
+  ed.selectSection(ed.section + 1)
   ed.dirty = true
 
 proc moveSection(ed: Editor, delta: int) =
   let target = ed.section + delta
-  if not ed.hasSection or target notin 0 ..< ed.tab.entries.len: return
-  swap(ed.tab.entries[ed.section], ed.tab.entries[target])
+  if not ed.hasSection or target notin 0 ..< ed.tab.sections.len: return
+  swap(ed.tab.sections[ed.section], ed.tab.sections[target])
   ed.section = target
   ed.dirty   = true
+
+proc addPart(ed: Editor) =
+  ## Inserts an empty part below the current one and moves onto it.
+  if not ed.hasSection: return
+  let at = if ed.hasPart: ed.part + 1 else: 0
+  ed.current.parts.insert(TabPart(repeats: 1), at)
+  ed.part = at
+  ed.row  = 0
+  ed.dirty = true
+
+proc duplicatePart(ed: Editor) =
+  if not ed.hasPart: return
+  ed.current.parts.insert(ed.currentPart, ed.part + 1)
+  inc ed.part
+  ed.dirty = true
+
+proc deletePart(ed: Editor) =
+  if not ed.hasPart: return
+  ed.confirm(&"delete part {ed.part + 1} of '{ed.current.name}'?",
+             proc(s: string) =
+    ed.current.parts.delete ed.part
+    ed.clampCursor()
+    ed.dirty = true)
+
+proc movePart(ed: Editor, delta: int) =
+  let target = ed.part + delta
+  if not ed.hasPart or target notin 0 ..< ed.current.parts.len: return
+  swap(ed.current.parts[ed.part], ed.current.parts[target])
+  ed.part  = target
+  ed.dirty = true
+
+proc setRepeats(ed: Editor) =
+  if not ed.hasPart: return
+  ed.prompt("repeats: ", $ed.currentPart.repeats, proc(s: string) =
+    try:
+      let n = s.strip.parseInt
+      if n < 0: raise newException(ValueError, "negative")
+      ed.currentPart.repeats = n
+      ed.dirty = true
+    except ValueError:
+      ed.status = &"invalid repeats: {s}")
 
 proc editTuning(ed: Editor) =
   let current = ed.tab.header.tuning.mapIt(($it).toUpperAscii).join(" ")
@@ -230,8 +276,9 @@ proc editTuning(ed: Editor) =
       return
     ed.tab.header.tuning = notes.mapIt(it.toLowerAscii[0])
     var dropped = 0
-    for e in ed.tab.entries.mitems:
-      dropped += e.normalize(ed.tab.header.tuning)
+    for sec in ed.tab.sections.mitems:
+      for p in sec.parts.mitems:
+        dropped += p.trimStrings(ed.tab.header.tuning.len)
     if dropped > 0:
       ed.status = &"dropped notes on {dropped} removed string(s)"
     ed.clampCursor()
@@ -270,19 +317,15 @@ proc reset(ed: Editor, path: string, tab: Tablature) =
   ed.dirty   = false
   ed.focus   = focusSections
   ed.section = 0
+  ed.part    = 0
   ed.row     = 0
   ed.col     = 0
   ed.scroll  = 0
+  ed.vscroll = 0
 
 proc loadFile(ed: Editor, path: string) =
-  var tab = parseTablature(path)
-  var dropped = 0
-  for e in tab.entries.mitems:
-    dropped += e.normalize(tab.header.tuning)
-  ed.reset(path, tab)
-  ed.status =
-    if dropped > 0: &"warning: {dropped} line(s) had no matching string"
-    else:           &"opened {path}"
+  ed.reset(path, parseTablature(path))
+  ed.status = &"opened {path}"
 
 proc startNew(ed: Editor, path: string) =
   ## Starts an empty tablature and walks through the header prompts.
@@ -336,7 +379,8 @@ proc fontPath(): string =
       &"font not found at {result}, set TABS_FONT to a .ttf/.otf file")
 
 proc renderPng(t: Tablature, path: string) =
-  ## Draws the tablature as a staff per section, wrapping long sections.
+  ## Draws each section as a heading followed by a staff per part, wrapping
+  ## long parts onto several staves.
   const
     margin   = 48'f32
     colW     = 24'f32
@@ -349,20 +393,23 @@ proc renderPng(t: Tablature, path: string) =
   let strs   = t.strings
   let staffH = strs.len.float32 * rowH
 
-  # Split every section into staff lines of at most maxCols columns.
-  var staves: seq[seq[Slice[int]]]
-  for e in t.entries:
-    let cols = max(e.lastIndex + 2, 8)
-    var parts: seq[Slice[int]]
+  # Split every part into staff lines of at most maxCols columns. Parts of
+  # a section share their width so their bars line up.
+  var staves: seq[seq[seq[Slice[int]]]]
+  for sec in t.sections:
+    let cols = max(sec.lastIndex + 2, 8)
+    var lines: seq[Slice[int]]
     var start = 0
     while start < cols:
-      parts.add start .. min(start + maxCols, cols) - 1
+      lines.add start .. min(start + maxCols, cols) - 1
       start += maxCols
-    staves.add parts
+    staves.add sec.parts.mapIt(lines)
 
   var height = margin * 2 + 88
   for parts in staves:
-    height += headH + parts.len.float32 * (staffH + staffGap)
+    height += headH
+    for lines in parts:
+      height += lines.len.float32 * (staffH + staffGap)
   let width = margin * 2 + labelW + (maxCols + 1).float32 * colW
 
   let image = newImage(width.int, height.int)
@@ -394,40 +441,45 @@ proc renderPng(t: Tablature, path: string) =
   y += 88
 
   let x0 = margin + labelW
-  for i, e in t.entries:
-    let reps = if e.repeats > 1: &"  x{e.repeats}" else: ""
-    put(e.name & reps, margin, y + headH / 2, 18, ink)
+  for i, sec in t.sections:
+    put(sec.name, margin, y + headH / 2, 18, ink)
     y += headH
 
-    for part in staves[i]:
-      # One column of padding on both sides keeps notes off the bars.
-      let x1 = x0 + (part.len + 1).float32 * colW
-      template lineY(r: int): float32 = y + r.float32 * rowH + rowH / 2
+    for k, p in sec.parts:
+      let lines = staves[i][k]
+      for l, cols in lines:
+        # One column of padding on both sides keeps notes off the bars.
+        let x1 = x0 + (cols.len + 1).float32 * colW
+        template lineY(r: int): float32 = y + r.float32 * rowH + rowH / 2
 
-      ctx.lineWidth   = 1
-      ctx.strokeStyle = faint
-      for r, s in strs:
-        put(($s).toUpperAscii, margin + labelW / 2, lineY(r), 14, ink, true)
-        ctx.strokeSegment(x0, lineY(r), x1, lineY(r))
+        ctx.lineWidth   = 1
+        ctx.strokeStyle = faint
+        for r, s in strs:
+          put(($s).toUpperAscii, margin + labelW / 2, lineY(r), 14, ink, true)
+          ctx.strokeSegment(x0, lineY(r), x1, lineY(r))
 
-      if strs.len > 0:
-        ctx.lineWidth   = 2
-        ctx.strokeStyle = ink
-        ctx.strokeSegment(x0, lineY(0), x0, lineY(strs.len - 1))
-        ctx.strokeSegment(x1, lineY(0), x1, lineY(strs.len - 1))
+        if strs.len > 0:
+          ctx.lineWidth   = 2
+          ctx.strokeStyle = ink
+          ctx.strokeSegment(x0, lineY(0), x0, lineY(strs.len - 1))
+          ctx.strokeSegment(x1, lineY(0), x1, lineY(strs.len - 1))
+          # Repeat count after the closing bar of the part's last staff.
+          if l == lines.high and p.repeats > 1:
+            put(&"x{p.repeats}", x1 + 8, (lineY(0) + lineY(strs.len - 1)) / 2,
+                14, ink)
 
-      for r in 0 ..< strs.len:
-        for c in part:
-          let fret = e.fretAt(t.slot(r), c)
-          if fret < 0: continue
-          let cx = x0 + (c - part.a + 1).float32 * colW
-          # Blank the string behind the number so it stays readable.
-          ctx.fillStyle = rgba(255, 255, 255, 255)
-          let w = font(14).layoutBounds($fret).x + 6
-          ctx.fillRect(cx - w / 2, lineY(r) - 8, w, 16)
-          put($fret, cx, lineY(r), 14, ink, true)
+        for r in 0 ..< strs.len:
+          for c in cols:
+            let fret = p.fretAt(t.slot(r), c)
+            if fret < 0: continue
+            let cx = x0 + (c - cols.a + 1).float32 * colW
+            # Blank the string behind the number so it stays readable.
+            ctx.fillStyle = rgba(255, 255, 255, 255)
+            let w = font(14).layoutBounds($fret).x + 6
+            ctx.fillRect(cx - w / 2, lineY(r) - 8, w, 16)
+            put($fret, cx, lineY(r), 14, ink, true)
 
-      y += staffH + staffGap
+        y += staffH + staffGap
 
   image.writeFile(path)
 
@@ -474,30 +526,21 @@ proc handleConfirm(ed: Editor, k: int) =
 proc handleSections(ed: Editor, k: int) =
   case k
   of key('j'), int(EVENT_KEY_ARROW_DOWN):
-    ed.section = min(ed.section + 1, max(ed.tab.entries.len - 1, 0))
+    ed.selectSection(min(ed.section + 1, max(ed.tab.sections.len - 1, 0)))
   of key('k'), int(EVENT_KEY_ARROW_UP):
-    ed.section = max(ed.section - 1, 0)
+    ed.selectSection(max(ed.section - 1, 0))
   of key('J'): ed.moveSection(1)
   of key('K'): ed.moveSection(-1)
   of key('a'): ed.addSection()
   of key('r'): ed.renameSection()
-  of key('n'): ed.setRepeats()
   of key('d'): ed.deleteSection()
   of key('y'): ed.duplicateSection()
-  of key('+'):
-    if ed.hasSection:
-      inc ed.current.repeats
-      ed.dirty = true
-  of key('-'):
-    if ed.hasSection and ed.current.repeats > 0:
-      dec ed.current.repeats
-      ed.dirty = true
   of int(EVENT_KEY_ENTER), int(EVENT_KEY_TAB), key('l'),
      int(EVENT_KEY_ARROW_RIGHT):
     if ed.hasSection and ed.tab.strings.len > 0:
       ed.focus = focusGrid
     elif ed.tab.strings.len == 0:
-      ed.status = "set a tuning first (h)"
+      ed.status = "set a tuning first (t)"
   else: discard
 
 proc handleGrid(ed: Editor, k: int) =
@@ -506,34 +549,65 @@ proc handleGrid(ed: Editor, k: int) =
     ed.focus = focusSections
     return
 
-  let s = ed.tab.slot(ed.row)
   if k notin key('0') .. key('9'):
     ed.pending = ""
+
+  # Part level keys, usable even when the section has no parts yet.
+  case k
+  of key('a'): ed.addPart(); return
+  of int(EVENT_KEY_ESC), int(EVENT_KEY_TAB):
+    ed.focus = focusSections
+    return
+  else: discard
+
+  if not ed.hasPart: return
+  let s = ed.tab.slot(ed.row)
 
   case k
   of key('h'), int(EVENT_KEY_ARROW_LEFT):  ed.col = max(ed.col - 1, 0)
   of key('l'), int(EVENT_KEY_ARROW_RIGHT): inc ed.col
-  of key('k'), int(EVENT_KEY_ARROW_UP):    ed.row = max(ed.row - 1, 0)
-  of key('j'), int(EVENT_KEY_ARROW_DOWN):  ed.row = min(ed.row + 1, strs.len - 1)
+  of key('k'), int(EVENT_KEY_ARROW_UP):
+    # Moving past the top string continues into the part above.
+    if ed.row > 0:
+      dec ed.row
+    elif ed.part > 0:
+      dec ed.part
+      ed.row = strs.len - 1
+  of key('j'), int(EVENT_KEY_ARROW_DOWN):
+    if ed.row < strs.len - 1:
+      inc ed.row
+    elif ed.part < ed.current.parts.len - 1:
+      inc ed.part
+      ed.row = 0
+  of key('J'): ed.movePart(1)
+  of key('K'): ed.movePart(-1)
+  of key('y'): ed.duplicatePart()
+  of key('X'): ed.deletePart()
+  of key('n'): ed.setRepeats()
+  of key('+'):
+    inc ed.currentPart.repeats
+    ed.dirty = true
+  of key('-'):
+    if ed.currentPart.repeats > 0:
+      dec ed.currentPart.repeats
+      ed.dirty = true
   of key('0') .. key('9'):
     # Up to two digits per cell, e.g. typing 1 then 2 gives fret 12.
     ed.pending = if ed.pending.len == 1: ed.pending & chr(k) else: $chr(k)
-    ed.current.setFret(s, ed.col, ed.pending.parseInt)
+    ed.currentPart.setFret(s, ed.col, ed.pending.parseInt)
     ed.dirty = true
   of key('x'), int(EVENT_KEY_DELETE), int(EVENT_KEY_BACKSPACE),
      int(EVENT_KEY_BACKSPACE2):
-    ed.current.clearFret(s, ed.col)
+    ed.currentPart.clearFret(s, ed.col)
     ed.dirty = true
   of key('i'):
-    ed.current.shiftColumns(ed.col, 1)
+    ed.currentPart.shiftColumns(ed.col, 1)
     ed.dirty = true
   of key('D'):
-    ed.current.deleteColumn(ed.col)
+    ed.currentPart.deleteColumn(ed.col)
     ed.dirty = true
   of int(EVENT_KEY_HOME): ed.col = 0
-  of int(EVENT_KEY_END):  ed.col = max(ed.current.lastIndex, 0)
-  of int(EVENT_KEY_ESC), int(EVENT_KEY_TAB):
-    ed.focus = focusSections
+  of int(EVENT_KEY_END):  ed.col = max(ed.currentPart.lastIndex, 0)
   else: discard
 
 proc handleKey(ed: Editor, k: int) =
@@ -581,18 +655,18 @@ proc drawSections(ed: Editor, bottom: int) =
   drawBox(0, 1, listWidth, bottom, (if focused: accent else: dim), bg)
   drawText(" sections ", 2, 1, (if focused: accent else: dim), bg)
 
-  if ed.tab.entries.len == 0:
+  if ed.tab.sections.len == 0:
     drawText("(empty, press a)", 2, 3, dim, bg)
     return
 
-  for i, e in ed.tab.entries:
+  for i, sec in ed.tab.sections:
     let y = 2 + i
     if y >= bottom - 1: break
-    var line = &" {e.name}"
-    let reps = &"x{e.repeats} "
-    let room = listWidth - 2 - reps.len
+    var line = &" {sec.name}"
+    let count = &"{sec.parts.len}p "
+    let room  = listWidth - 2 - count.len
     if line.runeLen > room: line = line.runeSubStr(0, room - 1) & "…"
-    line = line.alignLeft(room) & reps
+    line = line.alignLeft(room) & count
     let (lfg, lbg) =
       if i != ed.section: (fg, bg)
       elif focused:       (FG_COLOR_BLACK, BG_COLOR_CYAN)
@@ -600,6 +674,8 @@ proc drawSections(ed: Editor, bottom: int) =
     drawText(line, 1, y, lfg, lbg)
 
 proc drawGrid(ed: Editor, w, bottom: int) =
+  ## Draws every part of the current section as a staff, stacked vertically
+  ## and sharing the same columns.
   let focused = ed.focus == focusGrid
   let x0 = listWidth
   drawBox(x0, 1, w, bottom, (if focused: accent else: dim), bg)
@@ -608,13 +684,16 @@ proc drawGrid(ed: Editor, w, bottom: int) =
     drawText("no section selected", x0 + 2, 3, dim, bg)
     return
 
-  let e = ed.current
-  drawText(&" {e.name} x{e.repeats} ", x0 + 2, 1,
-           (if focused: accent else: dim), bg)
+  let sec = ed.current
+  drawText(&" {sec.name} ", x0 + 2, 1, (if focused: accent else: dim), bg)
 
   let strs = ed.tab.strings
   if strs.len == 0:
     drawText("no tuning set, press t", x0 + 2, 3, dim, bg)
+    return
+  if sec.parts.len == 0:
+    let hint = if focused: "press a" else: "press enter then a"
+    drawText(&"no parts, {hint}", x0 + 2, 3, dim, bg)
     return
 
   # Horizontal scrolling so the cursor is always visible.
@@ -622,31 +701,56 @@ proc drawGrid(ed: Editor, w, bottom: int) =
   let visible = max((w - gridX - 2) div cellWidth, 1)
   if ed.col < ed.scroll: ed.scroll = ed.col
   if ed.col >= ed.scroll + visible: ed.scroll = ed.col - visible + 1
-  let cols = max(max(e.lastIndex, ed.col) + 1 + 4, defaultCols)
+  let cols = max(max(sec.lastIndex, ed.col) + 1 + 4, defaultCols)
   let last = min(ed.scroll + visible, cols)
+
+  # Vertical scrolling by whole parts, each one is a label line, a line per
+  # string and a blank line (which the last visible part can do without).
+  let top    = 4
+  let limit  = bottom - 3
+  let blockH = strs.len + 2
+  let fit    = max((limit - top + 2) div blockH, 1)
+  if ed.part < ed.vscroll: ed.vscroll = ed.part
+  if ed.part >= ed.vscroll + fit: ed.vscroll = ed.part - fit + 1
+  ed.vscroll = clamp(ed.vscroll, 0, max(sec.parts.len - fit, 0))
 
   # Column ruler.
   for c in ed.scroll ..< last:
     if c mod 4 == 0:
       drawText($c, gridX + (c - ed.scroll) * cellWidth, 3, dim, bg)
 
-  for r, s in strs:
-    let y = 4 + r
-    drawText(&"{($s).toUpperAscii} |", x0 + 2, y, accent, bg)
-    for c in ed.scroll ..< last:
-      let fret = e.fretAt(ed.tab.slot(r), c)
-      let cell = if fret < 0: "---" else: ($fret).alignLeft(cellWidth, '-')
-      let x    = gridX + (c - ed.scroll) * cellWidth
-      let onCursor = focused and r == ed.row and c == ed.col
-      let (cfg, cbg) =
-        if onCursor:   (FG_COLOR_BLACK, BG_COLOR_CYAN)
-        elif fret < 0: (dim, bg)
-        else:          (FG_COLOR_YELLOW_BRIGHT, bg)
-      drawText(cell, x, y, cfg, cbg)
-    drawText("|", gridX + (last - ed.scroll) * cellWidth, y, accent, bg)
+  var y = top
+  for k in ed.vscroll ..< sec.parts.len:
+    if y > limit: break
+    let p       = sec.parts[k]
+    let current = k == ed.part
+    let more    =
+      if k == ed.vscroll and k > 0: "  ↑"
+      elif k == ed.vscroll + fit - 1 and k < sec.parts.len - 1: "  ↓"
+      else: ""
+    drawText(&"part {k + 1}/{sec.parts.len}  x{p.repeats}{more}", x0 + 2, y,
+             (if current and focused: accent else: dim), bg)
+    inc y
 
-  drawText(&"string {($strs[ed.row]).toUpperAscii}  col {ed.col}",
-           x0 + 2, 5 + strs.len, dim, bg)
+    for r, s in strs:
+      if y > limit: break
+      drawText(&"{($s).toUpperAscii} |", x0 + 2, y, accent, bg)
+      for c in ed.scroll ..< last:
+        let fret = p.fretAt(ed.tab.slot(r), c)
+        let cell = if fret < 0: "---" else: ($fret).alignLeft(cellWidth, '-')
+        let x    = gridX + (c - ed.scroll) * cellWidth
+        let onCursor = focused and current and r == ed.row and c == ed.col
+        let (cfg, cbg) =
+          if onCursor:   (FG_COLOR_BLACK, BG_COLOR_CYAN)
+          elif fret < 0: (dim, bg)
+          else:          (FG_COLOR_YELLOW_BRIGHT, bg)
+        drawText(cell, x, y, cfg, cbg)
+      drawText("|", gridX + (last - ed.scroll) * cellWidth, y, accent, bg)
+      inc y
+    inc y
+
+  drawText(&"part {ed.part + 1}  string {($strs[ed.row]).toUpperAscii}  " &
+           &"col {ed.col}", x0 + 2, bottom - 2, dim, bg)
 
 proc helpItems(ed: Editor): seq[string] =
   case ed.mode
@@ -656,11 +760,12 @@ proc helpItems(ed: Editor): seq[string] =
     case ed.focus
     of focusSections:
       @["j/k move", "a add", "r rename", "d delete", "y dup", "J/K reorder",
-        "+/-/n repeats", "enter edit", "e header", "t tuning", "N new file",
-        "o open", "p export png", "s save", "q quit"]
+        "enter edit", "e header", "t tuning", "N new file", "o open",
+        "p export png", "s save", "q quit"]
     of focusGrid:
       @["hjkl move", "0-9 fret", "x clear", "i insert col", "D delete col",
-        "esc back", "p export png", "s save", "q quit"]
+        "a add part", "y dup part", "X delete part", "J/K reorder parts",
+        "+/-/n repeats", "esc back", "p export png", "s save", "q quit"]
 
 proc wrapItems(items: seq[string], width: int): seq[string] =
   ## Packs items into as few lines as fit the width.

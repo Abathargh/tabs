@@ -17,14 +17,17 @@ type
     note*:  int
     index*: int
 
-  TabEntry* = object
-    name*:    string
+  TabPart* = object
     repeats*: int
-    tab*:     seq[tuple[string: char, nots: seq[StringNotation]]]
+    tabs*: Table[int, seq[StringNotation]]
+
+  TabSection* = object
+    name*:    string
+    parts*:   seq[TabPart]
 
   Tablature* = object
     header*:  TabHeader
-    entries*: seq[TabEntry]
+    sections*: seq[TabSection]
 
 proc parseTuning(stun: string): seq[char] =
   let notes = stun.split()
@@ -71,30 +74,53 @@ proc parseNotations(data: string): seq[StringNotation] =
 
     result.add StringNotation(note: note, index: idx)
 
-proc parseSection(data: string, tuning: seq[char]): TabEntry =
+proc parsePart(data: string, tuning: seq[char]): TabPart =
   let split = data.splitLines()
   if  split.len < 2:
-    raise newException(ValueError, fmt"bad section, got {split.len} entries")
+    raise newException(ValueError, fmt"bad part, got {split.len} entries")
 
   for line in split:
     let entry = line.split(":").mapIt(it.strip)
     if entry.len != 2: 
-      raise newException(ValueError, fmt"bad section, got {line}")
+      raise newException(ValueError, fmt"bad part, got {line}")
 
     case entry[0]
-    of "name":       result.name    = entry[1]
-    of "repeats":    result.repeats = entry[1].parseInt
+    of "repeats": result.repeats = entry[1].parseInt
     else:
-      if entry[0].len != 1:
-        raise newException(ValueError, fmt"expected a note, got {entry[0]}")
+      let note = entry[0].parseInt()
 
-      let note = entry[0].toLower()[0]
+      if note < 0 or note >= tuning.len:
+        raise newException(ValueError, fmt"string {note} not in range for tuning")
 
-      if note notin tuning:
-        raise newException(ValueError, fmt"string {note} not in {tuning}")
+      if note in result.tabs:
+        raise newException(ValueError, fmt"string {note} duplicate in part")
 
-      result.tab.add (note, parseNotations(entry[1]))
+      result.tabs[note] = parseNotations(entry[1])
 
+proc parseName(data: string): string =
+  let entries = data.splitLines
+  if  entries.len != 1:
+    raise newException(ValueError, fmt"bad section header, got {entries}")
+
+  let elems = entries[0].split(":").mapIt(it.strip) 
+  if  elems.len != 2 or elems[0] != "name":
+    raise newException(ValueError, fmt"bad section header, got {entries}")
+  elems[1]
+
+
+proc parseSection(data: string, tuning: seq[char]): TabSection =
+  const delim = "----"
+
+  let split = data.split(delim).mapIt(it.strip)
+  if  split.len < 1:
+    raise newException(ValueError, fmt"bad section, got {split.len} entries")
+
+  for i, section in enumerate(split):
+    if i == 0:
+      result.name = parseName(section)
+      continue
+
+    result.parts.add parsePart(section, tuning)
 
 proc parseTablature*(fname: string): Tablature =
   const delim = "::::"
@@ -111,6 +137,5 @@ proc parseTablature*(fname: string): Tablature =
     if i == 0:
       result.header = parseHeader(section)
       continue
-    result.entries.add parseSection(section, result.header.tuning)
-
+    result.sections.add parseSection(section, result.header.tuning)
 
