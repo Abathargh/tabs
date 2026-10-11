@@ -2,6 +2,5 @@ deps/
 build/
 
 nim.cfg
-*.png
 tabs
 
