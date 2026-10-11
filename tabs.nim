@@ -11,12 +11,15 @@ import parse
 
 type
   Focus = enum
-    focusSections, focusGrid
+    focusFiles, focusSections, focusGrid
 
   Mode = enum
     modeNormal, modePrompt, modeConfirm
 
   Editor = ref object
+    dir:      string
+    files:    seq[string]
+    file:     int
     path:     string
     tab:      Tablature
     dirty:    bool
@@ -127,8 +130,47 @@ proc validField(s: string): bool =
   ':' notin s and '\n' notin s and "----" notin s
 
 # ---------------------------------------------------------------------------
+# Tabs directory
+# ---------------------------------------------------------------------------
+
+proc tabsDir(): string =
+  ## Where tabs live when no directory is given.
+  getHomeDir() / ".tabs"
+
+proc tildify(path: string): string =
+  let home = getHomeDir().strip(leading = false, chars = {DirSep})
+  if path == home or path.startsWith(home & DirSep): "~" & path[home.len .. ^1]
+  else: path
+
+proc isTabFile(path: string): bool =
+  ## Tab files have no fixed extension, so look for the header instead.
+  try:
+    let f = open(path)
+    defer: f.close()
+    var line: string
+    f.readLine(line) and line.startsWith("song:")
+  except IOError:
+    false
+
+proc listTabs(dir: string): seq[string] =
+  ## Names of the tab files in dir, hidden files excluded.
+  for kind, path in walkDir(dir):
+    let name = path.extractFilename
+    if kind in {pcFile, pcLinkToFile} and not name.startsWith(".") and
+       path.isTabFile:
+      result.add name
+  result.sort()
+
+# ---------------------------------------------------------------------------
 # Editor actions
 # ---------------------------------------------------------------------------
+
+proc refreshFiles(ed: Editor) =
+  ## Rescans the directory, keeping the cursor on the open tab if listed.
+  ed.files = listTabs(ed.dir)
+  let open = ed.files.find(ed.path.extractFilename)
+  if open >= 0 and ed.path.parentDir == ed.dir: ed.file = open
+  ed.file = clamp(ed.file, 0, max(ed.files.len - 1, 0))
 
 proc current(ed: Editor): var TabSection = ed.tab.sections[ed.section]
 
@@ -161,7 +203,8 @@ proc save(ed: Editor) =
     # Round-trip through the parser to catch anything it would reject.
     discard parseTablature(ed.path)
     ed.dirty  = false
-    ed.status = &"saved {ed.path}"
+    ed.status = &"saved {ed.path.tildify}"
+    ed.refreshFiles()
   except CatchableError as e:
     ed.status = &"save failed: {e.msg}"
 
@@ -325,7 +368,7 @@ proc reset(ed: Editor, path: string, tab: Tablature) =
 
 proc loadFile(ed: Editor, path: string) =
   ed.reset(path, parseTablature(path))
-  ed.status = &"opened {path}"
+  ed.status = &"opened {path.extractFilename}"
 
 proc startNew(ed: Editor, path: string) =
   ## Starts an empty tablature and walks through the header prompts.
@@ -344,25 +387,29 @@ proc guardUnsaved(ed: Editor, action: proc()) =
 
 proc newFile(ed: Editor) =
   ed.guardUnsaved(proc() =
-    ed.prompt("new file path: ", "", proc(path: string) =
-      let path = path.strip
-      if path.len == 0: return
+    ed.prompt(&"new tab in {ed.dir.tildify}/: ", "", proc(name: string) =
+      let name = name.strip
+      if name.len == 0: return
+      if DirSep in name or name.startsWith("."):
+        ed.status = "name cannot contain '/' or start with '.'"
+        return
+      let path = ed.dir / name
       if fileExists(path):
-        ed.status = &"{path} already exists, press o to open it"
+        ed.status = &"{name} already exists"
         return
       ed.startNew(path)))
 
-proc openFile(ed: Editor) =
-  ed.guardUnsaved(proc() =
-    ed.prompt("open file: ", "", proc(path: string) =
-      let path = path.strip
-      if not fileExists(path):
-        ed.status = &"{path} does not exist, press N to create it"
-        return
-      try:
-        ed.loadFile(path)
-      except CatchableError as e:
-        ed.status = &"open failed: {e.msg}"))
+proc openSelected(ed: Editor, focus: Focus) =
+  ## Loads the tab under the cursor in the files list, unless already open.
+  if ed.file notin 0 ..< ed.files.len: return
+  let path = ed.dir / ed.files[ed.file]
+  if path != ed.path:
+    try:
+      ed.loadFile(path)
+    except CatchableError as e:
+      ed.status = &"open failed: {e.msg}"
+      return
+  ed.focus = focus
 
 # ---------------------------------------------------------------------------
 # PNG export
@@ -484,7 +531,9 @@ proc renderPng(t: Tablature, path: string) =
   image.writeFile(path)
 
 proc exportPng(ed: Editor) =
-  ed.prompt("export png to: ", ed.path.changeFileExt("png"), proc(s: string) =
+  ## Exports to the directory the tool was started from by default.
+  let initial = getCurrentDir() / ed.path.extractFilename.changeFileExt("png")
+  ed.prompt("export png to: ", initial, proc(s: string) =
     var path = s.strip
     if path.len == 0: return
     if not path.toLowerAscii.endsWith(".png"): path &= ".png"
@@ -523,8 +572,29 @@ proc handleConfirm(ed: Editor, k: int) =
   if k in [key('y'), key('Y')]:
     ed.onSubmit("y")
 
+proc handleFiles(ed: Editor, k: int) =
+  case k
+  of key('j'), key('k'), int(EVENT_KEY_ARROW_DOWN), int(EVENT_KEY_ARROW_UP):
+    let down = k in [key('j'), int(EVENT_KEY_ARROW_DOWN)]
+    ed.file  = clamp(ed.file + (if down: 1 else: -1), 0,
+                     max(ed.files.len - 1, 0))
+    # Preview while browsing, unless that would throw away changes.
+    if ed.dirty: ed.status = "unsaved changes, press enter to switch"
+    else:        ed.openSelected(focusFiles)
+  of int(EVENT_KEY_ENTER), int(EVENT_KEY_TAB), key('l'),
+     int(EVENT_KEY_ARROW_RIGHT):
+    if ed.file in 0 ..< ed.files.len and
+       ed.dir / ed.files[ed.file] != ed.path:
+      ed.guardUnsaved(proc() = ed.openSelected(focusSections))
+    elif ed.path.len > 0:
+      ed.focus = focusSections
+  else: discard
+
 proc handleSections(ed: Editor, k: int) =
   case k
+  of key('h'), int(EVENT_KEY_ARROW_LEFT), int(EVENT_KEY_ESC):
+    ed.refreshFiles()
+    ed.focus = focusFiles
   of key('j'), int(EVENT_KEY_ARROW_DOWN):
     ed.selectSection(min(ed.section + 1, max(ed.tab.sections.len - 1, 0)))
   of key('k'), int(EVENT_KEY_ARROW_UP):
@@ -617,16 +687,22 @@ proc handleKey(ed: Editor, k: int) =
   of modeConfirm: ed.handleConfirm(k); return
   of modeNormal:  discard
 
+  let needsTab = k in [int(EVENT_KEY_CTRL_S), key('s'), key('e'), key('t'),
+                       key('p')]
+  if needsTab and ed.path.len == 0:
+    ed.status = "no tab open, press N to create one"
+    return
+
   case k
   of int(EVENT_KEY_CTRL_S), key('s'): ed.save()
   of key('q'): ed.quit()
   of key('e'): ed.editHeader()
   of key('N'): ed.newFile()
-  of key('o'): ed.openFile()
   of key('t'): ed.editTuning()
   of key('p'): ed.exportPng()
   else:
     case ed.focus
+    of focusFiles:    ed.handleFiles(k)
     of focusSections: ed.handleSections(k)
     of focusGrid:     ed.handleGrid(k)
 
@@ -645,33 +721,68 @@ proc drawHeader(ed: Editor, w: int) =
   let tuning = h.tuning.mapIt(($it).toUpperAscii).join(" ")
   let mark   = if ed.dirty: " [+]" else: ""
   drawRectangle(0, 0, w, 1, BG_COLOR_BLUE, FG_COLOR_WHITE)
+  if ed.path.len == 0:
+    drawText(" no tab open", 0, 0, FG_COLOR_WHITE, BG_COLOR_BLUE)
+    return
   drawText(&" {ed.path.extractFilename}{mark}", 0, 0,
            FG_COLOR_WHITE, BG_COLOR_BLUE)
   let info = &"{h.song} · {h.artist} · {h.instrument} · {tuning} "
   drawText(info, max(w - info.runeLen, 0), 0, FG_COLOR_WHITE, BG_COLOR_BLUE)
 
-proc drawSections(ed: Editor, bottom: int) =
-  let focused = ed.focus == focusSections
-  drawBox(0, 1, listWidth, bottom, (if focused: accent else: dim), bg)
-  drawText(" sections ", 2, 1, (if focused: accent else: dim), bg)
+proc firstVisible(selected, count, rows: int): int =
+  ## First item to draw so the selected one fits in a list of rows lines.
+  clamp(selected - rows + 1, 0, max(count - rows, 0))
 
-  if ed.tab.sections.len == 0:
-    drawText("(empty, press a)", 2, 3, dim, bg)
+proc listLine(text, suffix: string): string =
+  ## Pads text to the list width, truncating it to leave room for suffix.
+  let room = listWidth - 2 - suffix.len
+  result = &" {text}"
+  if result.runeLen > room: result = result.runeSubStr(0, room - 1) & "…"
+  result = result.alignLeft(room) & suffix
+
+proc drawFiles(ed: Editor, top, bottom: int) =
+  let focused = ed.focus == focusFiles
+  drawBox(0, top, listWidth, bottom, (if focused: accent else: dim), bg)
+  var title = &" {ed.dir.tildify} "
+  if title.runeLen > listWidth - 4:
+    title = " …" & title.runeSubStr(title.runeLen - listWidth + 6)
+  drawText(title, 2, top, (if focused: accent else: dim), bg)
+
+  if ed.files.len == 0:
+    drawText("(no tabs, press N)", 2, top + 1, dim, bg)
     return
 
-  for i, sec in ed.tab.sections:
-    let y = 2 + i
-    if y >= bottom - 1: break
-    var line = &" {sec.name}"
-    let count = &"{sec.parts.len}p "
-    let room  = listWidth - 2 - count.len
-    if line.runeLen > room: line = line.runeSubStr(0, room - 1) & "…"
-    line = line.alignLeft(room) & count
+  let rows  = bottom - top - 2
+  let first = firstVisible(ed.file, ed.files.len, rows)
+  for i in first ..< min(first + rows, ed.files.len):
+    let open = ed.dir / ed.files[i] == ed.path
+    let (lfg, lbg) =
+      if i == ed.file and focused: (FG_COLOR_BLACK, BG_COLOR_CYAN)
+      elif open:                   (accent, bg)
+      else:                        (fg, bg)
+    drawText(listLine(ed.files[i], ""), 1, top + 1 + i - first, lfg, lbg)
+
+proc drawSections(ed: Editor, top, bottom: int) =
+  let focused = ed.focus == focusSections
+  drawBox(0, top, listWidth, bottom, (if focused: accent else: dim), bg)
+  drawText(" sections ", 2, top, (if focused: accent else: dim), bg)
+
+  if ed.path.len == 0:
+    return
+  if ed.tab.sections.len == 0:
+    drawText("(empty, press a)", 2, top + 1, dim, bg)
+    return
+
+  let rows  = bottom - top - 2
+  let first = firstVisible(ed.section, ed.tab.sections.len, rows)
+  for i in first ..< min(first + rows, ed.tab.sections.len):
+    let sec = ed.tab.sections[i]
     let (lfg, lbg) =
       if i != ed.section: (fg, bg)
       elif focused:       (FG_COLOR_BLACK, BG_COLOR_CYAN)
       else:               (FG_COLOR_BLACK, BG_COLOR_WHITE)
-    drawText(line, 1, y, lfg, lbg)
+    drawText(listLine(sec.name, &"{sec.parts.len}p "), 1, top + 1 + i - first,
+             lfg, lbg)
 
 proc drawGrid(ed: Editor, w, bottom: int) =
   ## Draws every part of the current section as a staff, stacked vertically
@@ -680,6 +791,8 @@ proc drawGrid(ed: Editor, w, bottom: int) =
   let x0 = listWidth
   drawBox(x0, 1, w, bottom, (if focused: accent else: dim), bg)
 
+  if ed.path.len == 0:
+    return
   if not ed.hasSection:
     drawText("no section selected", x0 + 2, 3, dim, bg)
     return
@@ -758,9 +871,12 @@ proc helpItems(ed: Editor): seq[string] =
   of modeConfirm: @["y confirm", "any key cancel"]
   of modeNormal:
     case ed.focus
+    of focusFiles:
+      @["j/k browse", "enter open", "N new tab", "e header", "t tuning",
+        "p export png", "s save", "q quit"]
     of focusSections:
       @["j/k move", "a add", "r rename", "d delete", "y dup", "J/K reorder",
-        "enter edit", "e header", "t tuning", "N new file", "o open",
+        "enter edit", "h tabs", "e header", "t tuning", "N new tab",
         "p export png", "s save", "q quit"]
     of focusGrid:
       @["hjkl move", "0-9 fret", "x clear", "i insert col", "D delete col",
@@ -799,8 +915,11 @@ proc draw(ed: Editor) =
   let help   = ed.helpItems.wrapItems(w - 2)
   let bottom = h - 1 - help.len
   removeArea(0, 0, w, h)
+  # The tabs list takes up to half of the left column, the rest is sections.
+  let filesH = clamp(ed.files.len + 2, 3, max((bottom - 1) div 2, 3))
   ed.drawHeader(w)
-  ed.drawSections(bottom)
+  ed.drawFiles(1, 1 + filesH)
+  ed.drawSections(1 + filesH, bottom)
   ed.drawGrid(w, bottom)
   ed.drawFooter(help, bottom)
 
@@ -808,13 +927,29 @@ proc draw(ed: Editor) =
 # Entry point
 # ---------------------------------------------------------------------------
 
-proc newEditor(path: string): Editor =
-  result = Editor(running: true)
-  if fileExists(path): result.loadFile(path)
-  else:                result.startNew(path)
+proc newEditor(target: string): Editor =
+  ## target is a directory to browse or a tab file to open, browsing the
+  ## directory it is in. Without one, tabs are browsed in tabsDir().
+  result = Editor(running: true, focus: focusFiles)
+  if target.len == 0:
+    result.dir = tabsDir()
+    createDir(result.dir)
+  elif dirExists(target):
+    result.dir = target.absolutePath.normalizedPath
+  else:
+    let path = target.absolutePath.normalizedPath
+    result.dir = path.parentDir
+    if fileExists(path): result.loadFile(path)
+    else:                result.startNew(path)
+    result.refreshFiles()
+    return
 
-proc runEditor*(path: string) =
-  let ed = newEditor(path)
+  result.refreshFiles()
+  if result.files.len > 0: result.openSelected(focusFiles)
+  else: result.status = &"no tabs in {result.dir.tildify}, press N"
+
+proc runEditor*(target: string) =
+  let ed = newEditor(target)
 
   proc onExit() {.noconv.} =
     deinitTextalot()
@@ -835,15 +970,18 @@ proc runEditor*(path: string) =
 when isMainModule:
   try:
     if paramCount() >= 2 and paramStr(1) == "--png":
-      # Headless export: tui --png file.txt [out.png]
-      let ed  = Editor()
-      ed.loadFile(paramStr(2))
+      # Headless export: tabs --png file [out.png], file is looked up in
+      # tabsDir() when not found as given, out defaults to the current dir.
+      var src = paramStr(2)
+      if not fileExists(src) and fileExists(tabsDir() / src):
+        src = tabsDir() / src
       let png = if paramCount() >= 3: paramStr(3)
-                else: paramStr(2).changeFileExt("png")
-      ed.tab.renderPng(png)
+                else: src.extractFilename.changeFileExt("png")
+      parseTablature(src).renderPng(png)
       echo &"exported {png}"
     else:
-      runEditor(if paramCount() >= 1: paramStr(1) else: "tab.txt")
+      # tabs [dir | file]
+      runEditor(if paramCount() >= 1: paramStr(1) else: "")
   except CatchableError as e:
     stderr.writeLine &"error: {e.msg}"
     quit(1)
