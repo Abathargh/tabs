@@ -10,3 +10,7 @@ srcDir        = "src"
 # Dependencies
 
 requires "nim >= 2.2.12"
+requires "https://codeberg.org/abathargh/textalot"
+
+requires "https://github.com/treeform/pixie"
+
