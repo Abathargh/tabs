@@ -14,7 +14,7 @@ proc fontPath(): string =
     raise newException(IOError,
       &"font not found at {result}, set TABS_FONT to a .ttf/.otf file")
 
-const pageParts = 5 ## parts per image, longer tabs span several files
+const pageParts = 10 ## parts per image, longer tabs span several files
 
 type PageEntry = tuple[sec: int, parts: Slice[int]]
 
